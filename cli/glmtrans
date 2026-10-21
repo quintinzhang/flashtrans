@@ -1,0 +1,112 @@
+#!/bin/bash
+# glmtrans — 终端翻译 CLI（依赖 FlashTrans 菜单栏 app 提供的本地服务）
+# 用法：glmtrans "hello"   |   echo 你好 | glmtrans   |   glmtrans --to zh "hello"
+#       glmtrans --set-key [KEY]     保存智谱 API Key（存入钥匙串）
+#       glmtrans --health            查看服务状态
+set -uo pipefail
+
+PORT="${FLASHTRANS_PORT:-8390}"
+BASE="http://127.0.0.1:${PORT}"
+TEXT=""
+TO="auto"
+RAW=""
+
+usage() {
+    cat <<'EOF'
+glmtrans — GLM 划词翻译的终端客户端
+
+用法:
+  glmtrans <文本>              翻译一段文字（中英自动互译）
+  echo <文本> | glmtrans       从管道读入
+  glmtrans --to zh|en <文本>   指定目标语言
+  glmtrans --raw <文本>        输出完整 JSON
+  glmtrans --set-key [KEY]     保存智谱 API Key（不带参数则隐藏输入）
+  glmtrans --health            查看本地服务状态
+  glmtrans --port <端口>       指定本地服务端口（默认 8390）
+
+示例:
+  glmtrans "The quick brown fox"
+  git log -1 --format=%s | glmtrans --to zh
+EOF
+}
+
+json_escape() {
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))'
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --to)
+            TO="${2:-auto}"
+            shift 2
+            ;;
+        --raw)
+            RAW="1"
+            shift
+            ;;
+        --port)
+            PORT="${2:?--port 需要参数}"
+            BASE="http://127.0.0.1:${PORT}"
+            shift 2
+            ;;
+        --health)
+            exec curl -sfS "$BASE/health"
+            ;;
+        --set-key)
+            shift
+            KEY="${1:-}"
+            if [ -z "$KEY" ]; then
+                printf 'API Key: ' >&2
+                read -r -s KEY
+                printf '\n' >&2
+            fi
+            BODY=$(printf '%s' "$KEY" | json_escape | sed 's/^/{"api_key":/; s/$/}/')
+            curl -sfS -X POST "$BASE/set-key" -H 'Content-Type: application/json' -d "$BODY" && echo
+            exit $?
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            TEXT="${TEXT:+$TEXT }$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$TEXT" ] && [ ! -t 0 ]; then
+    TEXT="$(cat)"
+fi
+if [ -z "$TEXT" ]; then
+    usage
+    exit 1
+fi
+
+BODY=$(printf '%s' "$TEXT" | json_escape | awk -v to="$TO" '{printf "{\"text\": %s, \"to\": \"%s\"}", $0, to}')
+RESP=$(curl -sS -X POST "$BASE/translate" -H 'Content-Type: application/json' -d "$BODY" 2>&1)
+CURL_STATUS=$?
+
+if [ $CURL_STATUS -ne 0 ]; then
+    echo "glmtrans: 无法连接本地服务（$BASE）。请先打开 FlashTrans.app。" >&2
+    exit 3
+fi
+
+if [ -n "$RAW" ]; then
+    printf '%s\n' "$RESP"
+    exit 0
+fi
+
+printf '%s' "$RESP" | python3 -c '
+import json, sys
+try:
+    result = json.load(sys.stdin)
+except Exception:
+    print("glmtrans: 响应解析失败", file=sys.stderr)
+    sys.exit(2)
+if "translation" in result:
+    print(result["translation"])
+else:
+    print(result.get("error", "未知错误"), file=sys.stderr)
+    sys.exit(2)
+'
